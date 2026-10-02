@@ -4,13 +4,16 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// The tasks popup. A quick-add line, four views (Due, Today, Week, All),
-// project chips, and the list grouped by project. A row expands to its
-// notes, links and the triage actions: Done, Tomorrow, Next week, Snooze,
-// Open link, Edit. Everything has a key, see the key catcher below.
+// The tasks popup. A quick-add line, a row of filter chips (Due, Today,
+// Week, Month, Quarter, All, and any you define), project chips, and the
+// list grouped by project. A row expands to its notes, links and the triage
+// actions: Done, Tomorrow, Next week, Snooze, Open link, Edit. Everything
+// has a key, see the key catcher below.
 //
-// BarWidget.qml owns the bar label and hands this panel the button to
-// anchor against and the service that runs taskbridge.
+// The chips and their counts come from the helper, which does the matching,
+// so the bar pill can show the same number for a filter. BarWidget.qml owns
+// the bar label and hands this panel the button to anchor against and the
+// service that runs taskbridge.
 Panel {
   id: root
   moduleName: "derekross.tasks"
@@ -21,20 +24,29 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  property string view: Model.normalizeView(String(setting("defaultView", "due")))
+  // The chips the helper matched, and the one the list is showing.
+  readonly property var filters: service ? service.filterList : []
+  property int filterIndex: 0
+  // Kept by name so a refresh, which sends a fresh list, cannot move it.
+  property string chosenFilterName: ""
+  readonly property var filter: filters.length > 0 ? filters[Math.max(0, Math.min(filters.length - 1, filterIndex))] : null
   property string project: ""
   property string cursorUuid: ""
   property string expandedUuid: ""
   property string editingUuid: ""
   property bool settingsOpen: false
+  // Which half of the settings is showing: "digest" or "filters".
+  property string settingsTab: "digest"
   property double now: Date.now()
   readonly property bool addFocused: addField.activeFocus
   // Keys go to a text field or a dropdown instead of the list while editing.
   property bool editorFocused: false
-  readonly property bool keysBlocked: addFocused || editingUuid !== "" || (settingsOpen && digestSettings.anyPopupOpen)
+  readonly property bool keysBlocked: addFocused || editingUuid !== ""
+    || (settingsOpen && (digestSettings.anyPopupOpen || filterSettings.anyPopupOpen
+      || filterSettings.anyFieldFocused))
 
   readonly property var allTasks: service ? service.tasks : []
-  readonly property var rows: Model.sortTasks(Model.filterTasks(allTasks, view, project), view)
+  readonly property var rows: Model.sortTasks(Model.tasksForFilter(allTasks, root.filterIndex, project), root.filter)
   readonly property var groups: Model.groupByProject(rows)
   readonly property var projects: service ? service.projects : []
   readonly property var counts: service ? service.counts : ({})
@@ -51,6 +63,7 @@ Panel {
     if (!service) return "Tasks service is not running. Enable the plugin with omarchy plugin enable derekross.tasks."
     if (!service.helperAvailable) return "The omarchy-taskbridge helper is not installed. Run dist/install.sh from the plugin folder."
     if (!service.taskAvailable) return "Taskwarrior is not installed. Install the task package."
+    if (!service.filtersSupported) return "This taskbridge is older than the plugin and knows nothing about filters. Run dist/install.sh from the plugin folder to rebuild it."
     if (service.lastError) return service.lastError
     return ""
   }
@@ -58,11 +71,7 @@ Panel {
   readonly property string emptyText: {
     if (statusText !== "") return statusText
     if (rows.length > 0) return ""
-    var where = project !== "" ? " in " + project : ""
-    if (view === "due") return "Nothing overdue or due today" + where + "."
-    if (view === "today") return "Nothing due through tomorrow" + where + "."
-    if (view === "week") return "Nothing due this week" + where + "."
-    return "No pending tasks" + where + "."
+    return Model.emptyText(root.filter, project)
   }
 
   readonly property string footerText: {
@@ -168,11 +177,30 @@ Panel {
     stopEditing()
   }
 
-  function setView(v) {
-    root.view = Model.normalizeView(v)
+  function setFilterIndex(index) {
+    if (root.filters.length === 0) return
+    root.filterIndex = Math.max(0, Math.min(root.filters.length - 1, index))
+    root.chosenFilterName = root.filter ? String(root.filter.name) : ""
     root.expandedUuid = ""
     root.cursorUuid = ""
   }
+
+  function cycleFilter(delta) {
+    if (root.filters.length === 0) return
+    root.setFilterIndex(Model.cycleIndex(root.filters.length, root.filterIndex, delta))
+  }
+
+  // The helper sends a fresh list on every refresh, so the chip is kept by
+  // name and `defaultView` only decides where it starts.
+  function syncFilter() {
+    if (root.filters.length === 0) { root.filterIndex = 0; return }
+    var wanted = root.chosenFilterName !== "" ? root.chosenFilterName : String(root.setting("defaultView", "due"))
+    var at = Model.resolveFilterIndex(root.filters, wanted, root.filterIndex)
+    if (at !== root.filterIndex) root.filterIndex = at
+    if (root.chosenFilterName === "" && root.filter) root.chosenFilterName = String(root.filter.name)
+  }
+
+  onFiltersChanged: root.syncFilter()
 
   function setProject(p) {
     root.project = root.project === p ? "" : p
@@ -288,10 +316,7 @@ Panel {
       blocked: root.keysBlocked
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveCursor(dy)
-        if (dx !== 0) {
-          var at = Model.VIEWS.indexOf(root.view)
-          root.setView(Model.VIEWS[(at + dx + Model.VIEWS.length) % Model.VIEWS.length])
-        }
+        if (dx !== 0) root.cycleFilter(dx)
       }
       onActivateRequested: { var t = root.focusedTask(); if (t) root.toggleExpanded(t.uuid) }
       onCloseRequested: {
@@ -316,10 +341,11 @@ Panel {
         else if (t === "u" || t === "U") { if (root.service) root.service.undo() }
         else if (t === "[") root.cycleProject(-1)
         else if (t === "]") root.cycleProject(1)
-        else if (t === "1") root.setView("due")
-        else if (t === "2") root.setView("today")
-        else if (t === "3") root.setView("week")
-        else if (t === "4") root.setView("all")
+        else if (t >= "1" && t <= "9") {
+          // A digit picks a chip, and stops at the number of filters there are.
+          var at = parseInt(t, 10) - 1
+          if (at < root.filters.length) root.setFilterIndex(at)
+        }
       }
 
       Flickable {
@@ -405,7 +431,7 @@ Panel {
 
               PanelActionButton {
                 iconText: "󰒓"
-                tooltipText: root.settingsOpen ? "Back to the list (Esc)" : "Daily digest settings (g)"
+                tooltipText: root.settingsOpen ? "Back to the list (Esc)" : "Settings (g): the daily digest and the filter chips"
                 foreground: root.settingsOpen ? Color.accent : root.foreground
                 fontFamily: root.fontFamily
                 onClicked: root.toggleSettings()
@@ -413,10 +439,35 @@ Panel {
             }
           }
 
-          // ---- Settings, in place of the list while open.
+          // ---- Settings, in place of the list while open. Two tabs, because
+          // nothing in the shell renders a plugin's settings for it.
+          Row {
+            visible: root.settingsOpen
+            spacing: Style.space(4)
+
+            Repeater {
+              model: [
+                { id: "digest", label: "Digest", hint: "One notification a day with what's overdue and due today" },
+                { id: "filters", label: "Filters", hint: "The chips above: what each one shows, and what the bar counts" }
+              ]
+
+              Button {
+                required property var modelData
+                text: modelData.label
+                tooltipText: modelData.hint
+                selected: root.settingsTab === modelData.id
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                bordered: true
+                onClicked: root.settingsTab = modelData.id
+              }
+            }
+          }
+
           DigestSettings {
             id: digestSettings
-            visible: root.settingsOpen
+            visible: root.settingsOpen && root.settingsTab === "digest"
             width: parent.width
             enabled: root.setting("digestEnabled", true) !== false
             time: String(root.setting("digestTime", "09:00"))
@@ -425,6 +476,23 @@ Panel {
             fontFamily: root.fontFamily
             onChanged: function(values) { root.persistSettings(values) }
             onSendNow: if (root.service) root.service.sendDigest()
+            onClosed: root.settingsOpen = false
+          }
+
+          FilterSettings {
+            id: filterSettings
+            visible: root.settingsOpen && root.settingsTab === "filters"
+            width: parent.width
+            filters: root.filters
+            projects: {
+              var out = []
+              for (var i = 0; i < root.projects.length; i++) out.push(String(root.projects[i].name))
+              return out
+            }
+            tags: Model.tagList(root.allTasks)
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onChanged: function(values) { root.persistSettings(values) }
             onClosed: root.settingsOpen = false
           }
 
@@ -440,29 +508,32 @@ Panel {
             Keys.onPressed: function(event) { root.handleAddKey(event) }
           }
 
-          // ---- Views.
+          // ---- Filters. Whatever chips the helper was given, each with its
+          // own count; the gear edits them.
           Row {
             visible: !root.settingsOpen
             spacing: Style.space(4)
 
             Repeater {
-              model: [
-                { id: "due", label: "Due", hint: "Overdue and due today (1)" },
-                { id: "today", label: "Today", hint: "Through tomorrow (2)" },
-                { id: "week", label: "Week", hint: "The next seven days (3)" },
-                { id: "all", label: "All", hint: "Every pending task, most urgent first (4)" }
-              ]
+              model: root.filters
 
               Button {
                 required property var modelData
-                text: modelData.label
-                tooltipText: modelData.hint
-                selected: root.view === modelData.id
+                required property int index
+                text: modelData.name
+                tooltipText: {
+                  var parts = [String(modelData.count) + (modelData.count === 1 ? " task" : " tasks")]
+                  if (index < 9) parts.push("(" + (index + 1) + ")")
+                  var summary = Model.filterSummary(modelData)
+                  if (summary !== "") parts.push(summary)
+                  return parts.join(" · ")
+                }
+                selected: root.filterIndex === index
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 bordered: true
-                onClicked: root.setView(modelData.id)
+                onClicked: root.setFilterIndex(index)
               }
             }
           }
