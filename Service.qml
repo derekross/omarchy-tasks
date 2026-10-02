@@ -55,6 +55,8 @@ Item {
     if (homeDir.indexOf("/") !== 0) {
       helperAvailable = false
       lastError = "HOME is not set, so the helper can't be found."
+    } else {
+      checkHelper()
     }
   }
 
@@ -74,8 +76,18 @@ Item {
 
   onIncludeWaitingChanged: if (settled) Qt.callLater(refresh)
 
+  // Whether the helper is there is decided by `test -x`, at load and again on
+  // every refresh tick while it is missing. dist/install.sh builds the helper
+  // after the plugin has loaded, so "not installed yet" must not wedge the
+  // widget in its error state until the shell restarts.
+  function checkHelper() {
+    if (checkProc.running) return
+    checkProc.running = true
+  }
+
   function refresh() {
-    if (!helperAvailable || snapProc.running) return
+    if (!helperAvailable) { checkHelper(); return }
+    if (snapProc.running) return
     refreshing = true
     var args = [helperPath, "snapshot"]
     if (includeWaiting) args.push("--waiting")
@@ -160,7 +172,6 @@ Item {
   Process {
     id: checkProc
     command: ["test", "-x", root.helperPath]
-    running: root.homeDir.indexOf("/") === 0
     onExited: function(exitCode) {
       root.helperAvailable = exitCode === 0
       if (!root.helperAvailable) root.lastError = "taskbridge is not installed. Run dist/install.sh from the plugin folder."
@@ -282,7 +293,7 @@ Item {
 
   Timer {
     interval: root.refreshSeconds * 1000
-    running: root.settled && root.helperAvailable
+    running: root.settled
     repeat: true
     onTriggered: root.refresh()
   }
