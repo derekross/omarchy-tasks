@@ -7,7 +7,10 @@
 var DAY_MS = 24 * 60 * 60 * 1000
 var WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-var VIEWS = ["due", "today", "week", "all"]
+// The windows a filter can ask for, in the order the editor offers them.
+var TIME_KEYS = ["due", "today", "week", "month", "quarter", "all"]
+var TIME_LABELS = { due: "Due", today: "Today", week: "Week", month: "Month", quarter: "Quarter", all: "All" }
+var PRIORITIES = ["H", "M", "L"]
 
 function clampInt(value, fallback, min, max) {
   var n = parseInt(value, 10)
@@ -15,8 +18,71 @@ function clampInt(value, fallback, min, max) {
   return Math.max(min, Math.min(max, n))
 }
 
-function normalizeView(view) {
-  return VIEWS.indexOf(view) === -1 ? "due" : view
+function normalizeTime(time) {
+  var t = String(time === undefined || time === null ? "" : time).trim().toLowerCase()
+  return TIME_KEYS.indexOf(t) === -1 ? "all" : t
+}
+
+// A filter is an object from the helper ({ name, time, projects, tags, … });
+// a bare string is accepted as its window, which keeps the sort/label
+// helpers usable on their own.
+function filterTime(filter) {
+  if (!filter) return "all"
+  return normalizeTime(typeof filter === "string" ? filter : filter.time)
+}
+
+// QML hands back some arrays as list values that fail Array.isArray, so
+// everything that walks one goes through here first.
+function arrayFrom(value) {
+  if (!value || typeof value === "string" || typeof value.length !== "number") return []
+  var out = []
+  for (var i = 0; i < value.length; i++) out.push(value[i])
+  return out
+}
+
+// Which chip the panel opens on: a filter's own name, or the window it asks
+// for ("month" finds the Month chip), else the fallback.
+function resolveFilterIndex(filters, wanted, fallback) {
+  var list = arrayFrom(filters)
+  var want = String(wanted === undefined || wanted === null ? "" : wanted).trim().toLowerCase()
+  if (want !== "") {
+    for (var i = 0; i < list.length; i++) {
+      if (String(list[i].name === undefined ? "" : list[i].name).trim().toLowerCase() === want) return i
+    }
+    for (var j = 0; j < list.length; j++) {
+      if (filterTime(list[j]) === want) return j
+    }
+  }
+  var at = parseInt(fallback, 10)
+  return isNaN(at) || at < 0 || at >= list.length ? 0 : at
+}
+
+function cycleIndex(length, current, delta) {
+  if (length <= 0) return 0
+  var at = Math.max(0, Math.min(length - 1, current))
+  return ((at + delta) % length + length) % length
+}
+
+function findFilter(filters, name) {
+  var want = String(name === undefined || name === null ? "" : name).trim().toLowerCase()
+  if (want === "") return null
+  var list = arrayFrom(filters)
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i].name === undefined ? "" : list[i].name).trim().toLowerCase() === want) return list[i]
+  }
+  return null
+}
+
+// The pill's number: a filter's own count when the setting names one,
+// otherwise one of the built-in modes. The three mode names keep their
+// meaning even if a chip is named "due".
+function countForPill(counts, mode, filters) {
+  var wanted = String(mode === undefined || mode === null ? "" : mode).trim().toLowerCase()
+  if (wanted !== "due" && wanted !== "overdue" && wanted !== "pending") {
+    var filter = findFilter(filters, mode)
+    if (filter) return Number(filter.count) || 0
+  }
+  return countForMode(counts, mode)
 }
 
 // The number on the bar pill.
@@ -86,31 +152,34 @@ function ageLabel(entryMs, nowMs) {
   return "added " + plural(Math.floor(days / 365), "year") + " ago"
 }
 
-function inView(task, view) {
-  var b = task.bucket
-  if (view === "due") return b === "overdue" || b === "today"
-  if (view === "today") return b === "overdue" || b === "today" || b === "tomorrow"
-  if (view === "week") return b === "overdue" || b === "today" || b === "tomorrow" || b === "week"
-  return true
+// Membership is the helper's call - `filters` on each task lists the chip
+// indexes it belongs to, so the panel only has to pick them out.
+function isInFilter(task, index) {
+  var have = task ? task.filters : null
+  if (!have || typeof have.length !== "number") return false
+  for (var i = 0; i < have.length; i++) {
+    if (Number(have[i]) === Number(index)) return true
+  }
+  return false
 }
 
-function filterTasks(tasks, view, project) {
-  view = normalizeView(view)
+function tasksForFilter(tasks, index, project) {
   var out = []
-  for (var i = 0; i < (tasks || []).length; i++) {
-    var t = tasks[i]
+  var list = tasks || []
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i]
     if (project !== "" && project !== null && project !== undefined && t.project !== project) continue
-    if (!inView(t, view)) continue
+    if (!isInFilter(t, index)) continue
     out.push(t)
   }
   return out
 }
 
-// Due-based views read best in date order; "all" keeps Taskwarrior's
-// urgency order, which is what `task next` shows.
-function sortTasks(list, view) {
+// A dated window reads best in date order; an unconstrained filter keeps
+// Taskwarrior's urgency order, which is what `task next` shows.
+function sortTasks(list, filter) {
   var copy = list.slice()
-  if (normalizeView(view) === "all") {
+  if (filterTime(filter) === "all") {
     copy.sort(function(a, b) { return (b.urgency - a.urgency) || cmpDue(a, b) || cmpText(a, b) })
   } else {
     copy.sort(function(a, b) { return cmpDue(a, b) || (b.urgency - a.urgency) || cmpText(a, b) })
@@ -163,6 +232,97 @@ function priorityMark(priority) {
 
 function projectLabel(project) {
   return project === "" ? "No project" : project
+}
+
+// ---- Named filters: the editor's shape, and the labels the panel shows.
+// The matching itself happens in the helper, so a filter means the same
+// thing in the list, on the chip and in the number the pill shows.
+
+// A new filter starts unconstrained.
+function draftFilter(name) {
+  return {
+    name: String(name || "New filter"),
+    time: "all",
+    projects: [],
+    tags: [],
+    priority: "",
+    match: "any",
+    priorityMode: "exact"
+  }
+}
+
+// The fields the helper reads back. Its own `count` is never sent.
+function filterInput(filter) {
+  filter = filter || {}
+  var priority = String(filter.priority === undefined || filter.priority === null ? "" : filter.priority)
+  return {
+    name: String(filter.name === undefined || filter.name === null ? "" : filter.name),
+    time: normalizeTime(filter.time),
+    projects: arrayFrom(filter.projects),
+    tags: arrayFrom(filter.tags),
+    priority: PRIORITIES.indexOf(priority) === -1 ? "" : priority,
+    match: String(filter.match === undefined || filter.match === null ? "" : filter.match).toLowerCase() === "all" ? "all" : "any",
+    priorityMode: String(filter.priorityMode === undefined || filter.priorityMode === null ? "" : filter.priorityMode).toLowerCase() === "atleast" ? "atleast" : "exact"
+  }
+}
+
+// The `--filters <json>` argument.
+function filtersJson(filters) {
+  var list = arrayFrom(filters)
+  var out = []
+  for (var i = 0; i < list.length; i++) out.push(filterInput(list[i]))
+  return JSON.stringify(out)
+}
+
+// "Month · btcmap · +next +personal · H only" for a chip tooltip.
+function filterSummary(filter) {
+  if (!filter) return ""
+  var parts = []
+  var time = filterTime(filter)
+  if (time !== "all") parts.push(TIME_LABELS[time])
+  var projects = arrayFrom(filter.projects)
+  if (projects.length > 0) parts.push(projects.join(", "))
+  var tags = arrayFrom(filter.tags)
+  if (tags.length > 0) {
+    var marks = []
+    for (var i = 0; i < tags.length; i++) marks.push("+" + tags[i])
+    parts.push(marks.join(filter.match === "all" ? " " : ", "))
+  }
+  if (filter.priority) parts.push(filter.priority + (filter.priorityMode === "atleast" ? " or above" : " only"))
+  return parts.join(" · ")
+}
+
+// Why the list is empty, in the filter's own terms.
+function emptyText(filter, project) {
+  var where = project !== "" && project !== null && project !== undefined ? " in " + project : ""
+  if (!filter) return "No pending tasks" + where + "."
+  var time = filterTime(filter)
+  if (time === "due") return "Nothing overdue or due today" + where + "."
+  if (time === "today") return "Nothing due through tomorrow" + where + "."
+  if (time === "week") return "Nothing due this week" + where + "."
+  if (time === "month") return "Nothing due this month" + where + "."
+  if (time === "quarter") return "Nothing due this quarter" + where + "."
+  var name = String(filter.name === undefined || filter.name === null ? "" : filter.name)
+  return (name === "" ? "Nothing in this filter" : "Nothing in " + name) + where + "."
+}
+
+// The tags in use, for the editor's picker.
+function tagList(tasks, limit) {
+  var seen = ({})
+  var out = []
+  var list = tasks || []
+  for (var i = 0; i < list.length; i++) {
+    var tags = arrayFrom(list[i].tags)
+    for (var j = 0; j < tags.length; j++) {
+      var tag = String(tags[j])
+      if (tag !== "" && !seen[tag]) {
+        seen[tag] = true
+        out.push(tag)
+      }
+    }
+  }
+  out.sort()
+  return out.slice(0, limit || 64)
 }
 
 // ---- Daily digest settings.

@@ -58,15 +58,51 @@ In the bar's widget settings, or the `derekross.tasks` entry in `~/.config/omarc
 
 | Setting | Default | What |
 | --- | --- | --- |
-| `countMode` | `due` | Number on the bar: `due` (overdue + today), `overdue`, or `pending` |
+| `countMode` | `due` | Number on the bar: `due` (overdue + today), `overdue`, `pending`, or the name of any filter you define |
 | `showWhenEmpty` | `true` | Keep the icon when nothing is due |
-| `defaultView` | `due` | View the panel opens on |
+| `defaultView` | `due` | The filter the panel opens on: its name, or a window like `month` |
 | `includeWaiting` | `false` | List tasks whose `wait:` date hasn't passed |
 | `digestEnabled` | `true` | Daily digest notification on or off |
 | `digestTime` | `09:00` | When it goes out, 24-hour `HH:mm` |
 | `digestDays` | `mon,tue,wed,thu,fri` | Which days |
 | `refreshSeconds` | `30` | How often to re-read Taskwarrior |
 | `syncMinutes` | `15` | `task sync` interval when a sync server is configured; `0` turns it off |
+| `filters` | *(the six below)* | The chips the panel shows, and what each one means |
+
+## Filters
+
+The chips in the panel are filters, and `omarchy-taskbridge` does the
+matching, so a filter's count is the number of rows the panel shows for it -
+and can also be the number on the bar.
+
+Each filter has a name, a time window (`due`, `today`, `week`, `month`,
+`quarter`, `all`), any number of projects, any number of tags, and a
+priority. A task is in a filter when all of those hold:
+
+- **Time** keeps what is already late. `Month` is everything left to do by
+  the end of this calendar month and `Quarter` by the end of this quarter;
+  `due` is overdue plus due today, `today` reaches tomorrow, `week` seven
+  days, and `all` is every pending task.
+- **Projects** are any-of, since a task has one project.
+- **Tags** are any-of unless the filter asks for all of them.
+- **Priority** is exact, or "or above" so that `M` also takes `H`.
+
+With no `filters` setting the chips are `Due`, `Today`, `Week`, `Month`,
+`Quarter` and `All`. The gear in the panel edits the list: add, rename,
+reorder, remove, and back to the defaults. Every change is written to
+`shell.json` as it is made and the counts come back on the next snapshot, so
+nothing about a filter is decided twice.
+
+`countMode` takes a filter's name as well as the three modes, which is how a
+filter's number gets onto the bar:
+
+```
+omarchy bar set derekross.tasks countMode "BTC Map"
+```
+
+Filters live in the helper, so an install from before this change needs
+`dist/install.sh` run again; the panel says so instead of showing an empty
+row.
 
 ## Update
 

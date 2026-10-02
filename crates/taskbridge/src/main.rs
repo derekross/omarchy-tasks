@@ -1,7 +1,8 @@
 //! omarchy-taskbridge: the small command the Omarchy Tasks plugin runs
 //! instead of talking to `task` directly. Every call prints one JSON object.
 //!
-//!   omarchy-taskbridge snapshot [--waiting]        pending tasks, counts, projects
+//!   omarchy-taskbridge snapshot [--waiting] [--filters <json>]
+//!                                                 pending tasks, counts, projects, filters
 //!   omarchy-taskbridge add <words…>                task add …
 //!   omarchy-taskbridge done <uuid>                 task <uuid> done
 //!   omarchy-taskbridge modify <uuid> <changes…>    task <uuid> modify due:… +tag …
@@ -23,7 +24,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use serde_json::{Value, json};
 use taskbridge::{
-    RawTask, build_snapshot, is_allowed_add_word, is_allowed_modification, is_uuid, unavailable,
+    FilterOut, RawTask, build_snapshot_filtered, is_allowed_add_word, is_allowed_modification,
+    is_uuid, parse_filters, unavailable,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(8);
@@ -147,7 +149,19 @@ fn error_text(out: &Output, fallback: &str) -> String {
     if text.is_empty() { fallback.to_string() } else { text.lines().last().unwrap_or(fallback).to_string() }
 }
 
-fn snapshot(include_waiting: bool) -> Result<Value> {
+/// `--filters <json>` from the plugin: the panel's own chips, normalised
+/// here. A malformed list narrows nothing rather than failing the snapshot.
+fn filter_arg(rest: &[&str]) -> Vec<FilterOut> {
+    let Some(at) = rest.iter().position(|a| *a == "--filters") else {
+        return Vec::new();
+    };
+    match rest.get(at + 1) {
+        Some(json) => parse_filters(json),
+        None => Vec::new(),
+    }
+}
+
+fn snapshot(include_waiting: bool, filters: &[FilterOut]) -> Result<Value> {
     if !task_available() {
         return Ok(unavailable("task is not installed"));
     }
@@ -185,7 +199,7 @@ fn snapshot(include_waiting: bool) -> Result<Value> {
             .ok()
             .and_then(|o| o.stdout.trim().parse::<usize>().ok())
     };
-    let mut snap = build_snapshot(&raw, &Local::now(), include_waiting, &task_version());
+    let mut snap = build_snapshot_filtered(&raw, &Local::now(), include_waiting, &task_version(), filters);
     if let Some(w) = waiting_count {
         snap.counts.waiting = w;
     }
@@ -217,7 +231,7 @@ fn dispatch(argv: &[String]) -> Result<Value> {
     let cmd = argv.first().map(String::as_str).unwrap_or("");
     let rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
     match cmd {
-        "snapshot" => snapshot(rest.iter().any(|a| *a == "--waiting")),
+        "snapshot" => snapshot(rest.iter().any(|a| *a == "--waiting"), &filter_arg(&rest)),
         "version" => Ok(json!({ "ok": true, "taskbridge": env!("CARGO_PKG_VERSION"), "task": task_version() })),
         "add" => {
             if rest.is_empty() {
@@ -260,7 +274,7 @@ fn dispatch(argv: &[String]) -> Result<Value> {
             }
             action(&["sync"], SYNC_TIMEOUT, "sync")
         }
-        "" | "-h" | "--help" | "help" => Ok(json!({ "ok": true, "usage": "omarchy-taskbridge snapshot [--waiting] | add <words…> | done <uuid> | modify <uuid> <changes…> | undo | sync | version" })),
+        "" | "-h" | "--help" | "help" => Ok(json!({ "ok": true, "usage": "omarchy-taskbridge snapshot [--waiting] [--filters <json>] | add <words…> | done <uuid> | modify <uuid> <changes…> | undo | sync | version" })),
         other => Err(anyhow!("unknown command: {other}")),
     }
 }
