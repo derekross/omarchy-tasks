@@ -121,6 +121,7 @@ Item {
   }
 
   function done(uuid) { act(["done", uuid], "Done") }
+  function remove(uuid) { act(["delete", uuid], "Deleted") }
   function modify(uuid, changes) { if (changes.length > 0) act(["modify", uuid].concat(changes), "Saved") }
   function defer(uuid, due) { act(["modify", uuid, "due:" + due], "Moved to " + due) }
   function wait(uuid, until) { act(["modify", uuid, "wait:" + until], "Waiting until " + until) }

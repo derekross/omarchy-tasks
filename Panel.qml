@@ -7,7 +7,8 @@ import "Model.js" as Model
 // The tasks popup. A quick-add line, four views (Due, Today, Week, All),
 // project chips, and the list grouped by project. A row expands to its
 // notes, links and the triage actions: Done, Tomorrow, Next week, Snooze,
-// Open link, Edit. Everything has a key, see the key catcher below.
+// Open link, Edit, Delete. Everything but Delete has a key (a destructive
+// action should take a deliberate click), see the key catcher below.
 //
 // BarWidget.qml owns the bar label and hands this panel the button to
 // anchor against and the service that runs taskbridge.
@@ -225,6 +226,8 @@ Panel {
   function done(task) { actOn(task, function(t) { service.done(t.uuid) }) }
   function defer(task, due) { actOn(task, function(t) { service.defer(t.uuid, due) }) }
   function snooze(task) { actOn(task, function(t) { service.wait(t.uuid, "1w") }) }
+  // Recoverable: task delete leaves the task in the database, and `u` undoes it.
+  function remove(task) { actOn(task, function(t) { service.remove(t.uuid) }) }
 
   // No shell: the URL was checked by the helper and is checked again here,
   // then handed to Qt, which asks the desktop to open it.
@@ -670,6 +673,11 @@ Panel {
                         fontFamily: root.fontFamily
                         onSaved: function(changes) { root.saveEdit(row.task, changes) }
                         onCancelled: root.stopEditing()
+                        onDeleted: function(uuid) {
+                          if (uuid === "") return
+                          root.stopEditing()
+                          root.remove(row.task)
+                        }
                       }
                     }
 
@@ -771,6 +779,15 @@ Panel {
                         fontSize: Style.font.caption
                         bordered: true
                         onClicked: root.startEditing(row.task)
+                      }
+                      Button {
+                        text: "Delete"
+                        tooltipText: "task delete: leaves the list, u undoes it"
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        bordered: true
+                        onClicked: root.remove(row.task)
                       }
                     }
                   }

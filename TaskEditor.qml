@@ -17,6 +17,7 @@ Column {
 
   signal saved(var changes)
   signal cancelled()
+  signal deleted(string uuid)
 
   readonly property bool anyFocused: descriptionField.activeFocus || projectField.activeFocus
     || dueField.activeFocus || tagsField.activeFocus || priorityBox.popupOpen
@@ -141,6 +142,16 @@ Column {
       fontSize: Style.font.caption
       bordered: true
       onClicked: editor.cancelled()
+    }
+
+    Button {
+      text: "Delete"
+      tooltipText: "task delete: leaves the list, u undoes it"
+      foreground: editor.foreground
+      fontFamily: editor.fontFamily
+      fontSize: Style.font.caption
+      bordered: true
+      onClicked: editor.deleted(editor.task ? editor.task.uuid : "")
     }
   }
 }

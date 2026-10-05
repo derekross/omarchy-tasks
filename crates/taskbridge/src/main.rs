@@ -237,6 +237,16 @@ fn dispatch(argv: &[String]) -> Result<Value> {
             }
             action(&[uuid, "done"], TIMEOUT, "done")
         }
+        // Taskwarrior's delete, not purge: the task leaves the pending list but
+        // stays in the database, so undo can bring it back. `modify` deliberately
+        // refuses status:* (see is_allowed_modification), hence a subcommand.
+        "delete" => {
+            let uuid = rest.first().copied().unwrap_or("");
+            if !is_uuid(uuid) {
+                return Err(anyhow!("delete needs a full uuid"));
+            }
+            action(&[uuid, "delete"], TIMEOUT, "delete")
+        }
         "modify" => {
             let uuid = rest.first().copied().unwrap_or("");
             if !is_uuid(uuid) {
@@ -260,7 +270,7 @@ fn dispatch(argv: &[String]) -> Result<Value> {
             }
             action(&["sync"], SYNC_TIMEOUT, "sync")
         }
-        "" | "-h" | "--help" | "help" => Ok(json!({ "ok": true, "usage": "omarchy-taskbridge snapshot [--waiting] | add <words…> | done <uuid> | modify <uuid> <changes…> | undo | sync | version" })),
+        "" | "-h" | "--help" | "help" => Ok(json!({ "ok": true, "usage": "omarchy-taskbridge snapshot [--waiting] | add <words…> | done <uuid> | delete <uuid> | modify <uuid> <changes…> | undo | sync | version" })),
         other => Err(anyhow!("unknown command: {other}")),
     }
 }

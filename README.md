@@ -4,9 +4,10 @@ Your [Taskwarrior](https://taskwarrior.org) tasks in the [Omarchy](https://omarc
 
 - **On the bar:** a checklist glyph and the number of tasks that need you (overdue plus due today by default). It turns urgent when something is overdue. Left click opens the panel, right click opens it on the add line, middle click syncs.
 - **In the panel:** a quick-add line that takes Taskwarrior's own syntax (`Call Alex project:nostr4 due:friday +call`), four views (Due, Today, Week, All), project chips with counts, and the list grouped by project.
-- **Triage, not forms.** A row expands to its notes and the actions that matter: Done, Tomorrow, Next week, Snooze (hide for a week), Open link, Edit. Each has a key.
+- **Triage, not forms.** A row expands to its notes and the actions that matter: Done, Tomorrow, Next week, Snooze (hide for a week), Open link, Edit, Delete. Each has a key except Delete, which takes a deliberate click.
 - **Edit in place.** Edit turns the row into a small form: description, project, due (any Taskwarrior date: `2026-10-07`, `friday`, `eom`), priority and tags. Enter saves only what changed, Esc cancels.
 - **Links.** URLs in a task's description or annotations, and the `gitlab_url` field if you use one, become an Open link button.
+- **Delete means Taskwarrior's `delete`, never `purge`.** The task leaves the list but stays in your database, so `u` (or `task undo`) brings it back. Nothing is destroyed until you purge it yourself.
 - **Daily digest.** One desktop notification with what's overdue and due today. The gear in the panel turns it on or off, sets the time and the days (weekdays by default), and has a Send now button.
 - **Sync.** Runs `task sync` every 15 minutes, or on demand, when a sync server is configured in `~/.taskrc`. Without one, sync is skipped.
 - **Small.** A Rust helper (`omarchy-taskbridge`) that only ever runs `task`, with a hard timeout, plus the QML. No Python, no Timewarrior, no about page.
@@ -23,6 +24,7 @@ Your [Taskwarrior](https://taskwarrior.org) tasks in the [Omarchy](https://omarc
 | `z` | Snooze: hide for a week (`wait:1w`) |
 | `o` | Open the task's first link |
 | `e` | Edit the task in place |
+| — | Delete is a button in the row and in the edit form: no key, so it cannot be hit by accident |
 | `g` or `,` | Daily digest settings |
 | `a` or `+` | Jump to the add line |
 | `1` `2` `3` `4`, `h` / `l` | Views: Due, Today, Week, All |
