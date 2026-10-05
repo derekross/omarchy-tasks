@@ -19,16 +19,26 @@ BarWidget {
   readonly property bool showWhenEmpty: setting("showWhenEmpty", true) !== false
 
   readonly property var counts: service ? service.counts : ({})
-  readonly property int count: Model.countForMode(counts, countMode)
+  readonly property var filterList: service ? service.filterList : []
+  // countMode is a filter's name or one of the built-in modes.
+  readonly property var namedFilter: Model.findFilter(filterList, countMode)
+  readonly property int count: Model.countForPill(counts, countMode, filterList)
   readonly property int overdue: counts && counts.overdue ? counts.overdue : 0
+  // A filter of the user's own naming is urgent when *it* has something in
+  // it; the built-in modes are urgent on anything overdue.
+  readonly property bool alerting: namedFilter ? count > 0 : overdue > 0
   readonly property bool healthy: service ? (service.helperAvailable && service.taskAvailable && service.lastError === "") : false
 
-  readonly property string label: count > 0 ? "  " + count : ""
+  readonly property string label: count > 0 ? "  " + count : ""
   readonly property string tooltip: {
     if (!service) return "Tasks service is not running. Enable the plugin with omarchy plugin enable derekross.tasks."
     if (!service.helperAvailable) return "The omarchy-taskbridge helper is not installed. Run dist/install.sh from the plugin folder."
     if (!service.taskAvailable) return "Taskwarrior is not installed. Install the task package."
     if (service.lastError) return service.lastError
+    if (namedFilter) {
+      var what = Model.filterSummary(namedFilter)
+      return (what === "" ? namedFilter.name : namedFilter.name + " · " + what) + " — " + Model.plural(count, "task")
+    }
     return Model.summary(counts)
   }
 
@@ -97,7 +107,7 @@ BarWidget {
     bar: root.bar
     text: root.label
     fontSize: Style.font.caption
-    active: root.overdue > 0 || !root.healthy
+    active: root.alerting || !root.healthy
     useActiveColor: true
     dimmed: root.healthy && root.count === 0
     tooltipText: root.tooltip

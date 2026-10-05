@@ -4,9 +4,10 @@ Your [Taskwarrior](https://taskwarrior.org) tasks in the [Omarchy](https://omarc
 
 - **On the bar:** a checklist glyph and the number of tasks that need you (overdue plus due today by default). It turns urgent when something is overdue. Left click opens the panel, right click opens it on the add line, middle click syncs.
 - **In the panel:** a quick-add line that takes Taskwarrior's own syntax (`Call Alex project:nostr4 due:friday +call`), four views (Due, Today, Week, All), project chips with counts, and the list grouped by project.
-- **Triage, not forms.** A row expands to its notes and the actions that matter: Done, Tomorrow, Next week, Snooze (hide for a week), Open link, Edit. Each has a key.
+- **Triage, not forms.** A row expands to its notes and the actions that matter: Done, Tomorrow, Next week, Snooze (hide for a week), Open link, Edit, Delete. Each has a key except Delete, which takes a deliberate click.
 - **Edit in place.** Edit turns the row into a small form: description, project, due (any Taskwarrior date: `2026-10-07`, `friday`, `eom`), priority and tags. Enter saves only what changed, Esc cancels.
 - **Links.** URLs in a task's description or annotations, and the `gitlab_url` field if you use one, become an Open link button.
+- **Delete means Taskwarrior's `delete`, never `purge`.** The task leaves the list but stays in your database, so `u` (or `task undo`) brings it back. Nothing is destroyed until you purge it yourself.
 - **Daily digest.** One desktop notification with what's overdue and due today. The gear in the panel turns it on or off, sets the time and the days (weekdays by default), and has a Send now button.
 - **Sync.** Runs `task sync` every 15 minutes, or on demand, when a sync server is configured in `~/.taskrc`. Without one, sync is skipped.
 - **Small.** A Rust helper (`omarchy-taskbridge`) that only ever runs `task`, with a hard timeout, plus the QML. No Python, no Timewarrior, no about page.
@@ -23,6 +24,7 @@ Your [Taskwarrior](https://taskwarrior.org) tasks in the [Omarchy](https://omarc
 | `z` | Snooze: hide for a week (`wait:1w`) |
 | `o` | Open the task's first link |
 | `e` | Edit the task in place |
+| — | Delete is a button in the row and in the edit form: no key, so it cannot be hit by accident |
 | `g` or `,` | Daily digest settings |
 | `a` or `+` | Jump to the add line |
 | `1` `2` `3` `4`, `h` / `l` | Views: Due, Today, Week, All |
@@ -58,15 +60,51 @@ In the bar's widget settings, or the `derekross.tasks` entry in `~/.config/omarc
 
 | Setting | Default | What |
 | --- | --- | --- |
-| `countMode` | `due` | Number on the bar: `due` (overdue + today), `overdue`, or `pending` |
+| `countMode` | `due` | Number on the bar: `due` (overdue + today), `overdue`, `pending`, or the name of any filter you define |
 | `showWhenEmpty` | `true` | Keep the icon when nothing is due |
-| `defaultView` | `due` | View the panel opens on |
+| `defaultView` | `due` | The filter the panel opens on: its name, or a window like `month` |
 | `includeWaiting` | `false` | List tasks whose `wait:` date hasn't passed |
 | `digestEnabled` | `true` | Daily digest notification on or off |
 | `digestTime` | `09:00` | When it goes out, 24-hour `HH:mm` |
 | `digestDays` | `mon,tue,wed,thu,fri` | Which days |
 | `refreshSeconds` | `30` | How often to re-read Taskwarrior |
 | `syncMinutes` | `15` | `task sync` interval when a sync server is configured; `0` turns it off |
+| `filters` | *(the six below)* | The chips the panel shows, and what each one means |
+
+## Filters
+
+The chips in the panel are filters, and `omarchy-taskbridge` does the
+matching, so a filter's count is the number of rows the panel shows for it -
+and can also be the number on the bar.
+
+Each filter has a name, a time window (`due`, `today`, `week`, `month`,
+`quarter`, `all`), any number of projects, any number of tags, and a
+priority. A task is in a filter when all of those hold:
+
+- **Time** keeps what is already late. `Month` is everything left to do by
+  the end of this calendar month and `Quarter` by the end of this quarter;
+  `due` is overdue plus due today, `today` reaches tomorrow, `week` seven
+  days, and `all` is every pending task.
+- **Projects** are any-of, since a task has one project.
+- **Tags** are any-of unless the filter asks for all of them.
+- **Priority** is exact, or "or above" so that `M` also takes `H`.
+
+With no `filters` setting the chips are `Due`, `Today`, `Week`, `Month`,
+`Quarter` and `All`. The gear in the panel edits the list: add, rename,
+reorder, remove, and back to the defaults. Every change is written to
+`shell.json` as it is made and the counts come back on the next snapshot, so
+nothing about a filter is decided twice.
+
+`countMode` takes a filter's name as well as the three modes, which is how a
+filter's number gets onto the bar:
+
+```
+omarchy bar set derekross.tasks countMode "BTC Map"
+```
+
+Filters live in the helper, so an install from before this change needs
+`dist/install.sh` run again; the panel says so instead of showing an empty
+row.
 
 ## Update
 

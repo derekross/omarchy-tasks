@@ -29,7 +29,16 @@ Item {
   property var tasks: []
   property var counts: ({})
   property var projects: []
-  property string taskVersion: ""
+  // Every tag on the listed tasks, most-used first: the tag line's chips.
+  property var tags: []
+  /// The filters the plugin defined, sent to the helper with every snapshot.
+  property var filters: []
+  /// What the helper echoed back: name, window, selectors and count. This is
+  /// what the bar's pill and the panel's chips read.
+  property var filterList: []
+  /// False while the installed helper predates filters.
+  property bool filtersSupported: true
+  property var taskVersion: ""
   property bool helperAvailable: true
   property bool taskAvailable: true
   property bool refreshing: false
@@ -66,6 +75,10 @@ Item {
     digestEnabled = s.digestEnabled === undefined || s.digestEnabled === null ? true : s.digestEnabled === true
     digestTime = Model.parseHHMM(s.digestTime) ? String(s.digestTime).trim() : "09:00"
     digestDays = s.digestDays === undefined || s.digestDays === null ? Model.DEFAULT_DIGEST_DAYS : String(s.digestDays)
+    var wanted = Model.arrayFrom(s.filters)
+    var changed = Model.filtersJson(wanted) !== Model.filtersJson(filters)
+    filters = wanted
+    if (settled && changed) Qt.callLater(refresh)
     if (!settled) {
       settled = true
       Qt.callLater(refresh)
@@ -79,6 +92,12 @@ Item {
     refreshing = true
     var args = [helperPath, "snapshot"]
     if (includeWaiting) args.push("--waiting")
+    // The helper does the matching, so a filter means the same thing on the
+    // bar, on its chip and in the list.
+    if (filters.length > 0) {
+      args.push("--filters")
+      args.push(Model.filtersJson(filters))
+    }
     snapProc.command = args
     snapProc.running = true
   }
@@ -121,6 +140,7 @@ Item {
   }
 
   function done(uuid) { act(["done", uuid], "Done") }
+  function remove(uuid) { act(["delete", uuid], "Deleted") }
   function modify(uuid, changes) { if (changes.length > 0) act(["modify", uuid].concat(changes), "Saved") }
   function defer(uuid, due) { act(["modify", uuid, "due:" + due], "Moved to " + due) }
   function wait(uuid, until) { act(["modify", uuid, "wait:" + until], "Waiting until " + until) }
@@ -193,6 +213,11 @@ Item {
       root.tasks = data.tasks || []
       root.counts = data.counts || {}
       root.projects = data.projects || []
+      root.tags = data.tags || []
+      // A helper older than the plugin returns no filters at all, and the
+      // panel says so rather than showing an empty row of chips.
+      root.filtersSupported = data.filters !== undefined
+      root.filterList = data.filters || []
       root.taskVersion = String(data.taskVersion || "")
       root.lastError = ""
       root.lastRefresh = Date.now()

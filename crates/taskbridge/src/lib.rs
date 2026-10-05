@@ -5,7 +5,7 @@
 //! Everything here is pure so it can be tested with a fixed clock. Running
 //! `task` itself lives in `main.rs`.
 
-use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -92,6 +92,8 @@ pub struct TaskOut {
     pub active: bool,
     pub blocked: bool,
     pub bucket: Bucket,
+    /// Indexes into `Snapshot.filters` of every filter this task matches.
+    pub filters: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -105,6 +107,10 @@ pub struct Counts {
     pub week: usize,
     /// Overdue plus due today: what the bar shows by default.
     pub due: usize,
+    /// Everything due up to the end of this calendar month, overdue included.
+    pub month: usize,
+    /// The same through the end of this calendar quarter.
+    pub quarter: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +119,47 @@ pub struct ProjectCount {
     pub name: String,
     pub pending: usize,
     pub overdue: usize,
+}
+
+/// One tag on the listed pending tasks, for the plugin's tag line. Tags have
+/// no overdue notion of their own, so this is a name and a count.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCount {
+    pub name: String,
+    pub pending: usize,
+}
+
+/// A named filter the panel shows a chip for and the bar can count.
+/// Input fields are clamped on the way in and echoed back normalised, so
+/// the plugin renders exactly what was applied rather than what it sent.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterOut {
+    pub name: String,
+    /// due | today | week | month | quarter | all
+    pub time: String,
+    pub projects: Vec<String>,
+    pub tags: Vec<String>,
+    /// "", "H", "M" or "L".
+    pub priority: String,
+    /// How `tags` combine: "any" (default) or "all". A task has one
+    /// project, so `projects` is always any-of.
+    #[serde(rename = "match")]
+    pub match_mode: String,
+    /// How `priority` matches: "exact" (default) or "atleast".
+    pub priority_mode: String,
+    /// True for a line-break entry in the plugin's list: it holds its position
+    /// (so the indexes the tasks carry stay aligned with the array the plugin
+    /// sent) and matches nothing at all.
+    #[serde(rename = "break")]
+    pub is_break: bool,
+    /// "projects" or "tags" for a generated line of chips the plugin builds
+    /// from the snapshot rather than from a window of its own. Empty for a
+    /// chip, and like a break it holds its position and matches nothing.
+    pub facet: String,
+    /// Tasks in the snapshot this filter matches.
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +171,9 @@ pub struct Snapshot {
     pub generated_ms: i64,
     pub counts: Counts,
     pub projects: Vec<ProjectCount>,
+    /// Every tag on the listed tasks, most-used first.
+    pub tags: Vec<TagCount>,
+    pub filters: Vec<FilterOut>,
     pub tasks: Vec<TaskOut>,
 }
 
@@ -158,6 +208,286 @@ pub fn bucket_for<Tz: TimeZone>(due: Option<DateTime<Utc>>, now: &DateTime<Tz>) 
     }
 }
 
+/// The time window a filter asks for. Every window keeps what is already
+/// late, so "Month" reads as "everything left to do by the end of this
+/// month", which is what a person means by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    Due,
+    Today,
+    Week,
+    Month,
+    Quarter,
+    All,
+}
+
+impl Window {
+    /// Unknown names fall back to `All` and are echoed back as such, so a
+    /// typo in a hand-edited settings file shows up in the panel rather
+    /// than silently narrowing the list.
+    pub fn parse(value: &str) -> Window {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "due" => Window::Due,
+            "today" => Window::Today,
+            "week" => Window::Week,
+            "month" => Window::Month,
+            "quarter" => Window::Quarter,
+            _ => Window::All,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Window::Due => "due",
+            Window::Today => "today",
+            Window::Week => "week",
+            Window::Month => "month",
+            Window::Quarter => "quarter",
+            Window::All => "all",
+        }
+    }
+}
+
+/// The last day of the calendar month `day` falls in.
+pub fn end_of_month(day: NaiveDate) -> Option<NaiveDate> {
+    let first_of_next = if day.month() == 12 {
+        NaiveDate::from_ymd_opt(day.year() + 1, 1, 1)?
+    } else {
+        NaiveDate::from_ymd_opt(day.year(), day.month() + 1, 1)?
+    };
+    first_of_next.checked_sub_days(Days::new(1))
+}
+
+/// The last day of the calendar quarter `day` falls in.
+pub fn end_of_quarter(day: NaiveDate) -> Option<NaiveDate> {
+    let end_month = ((day.month() - 1) / 3) * 3 + 3;
+    end_of_month(NaiveDate::from_ymd_opt(day.year(), end_month, 1)?)
+}
+
+/// Does a due date fall in `window`, seen from `today` in the local zone?
+/// A task with no due date matches only `All`.
+pub fn in_window<Tz: TimeZone>(due_ms: Option<i64>, now: &DateTime<Tz>, window: Window) -> bool {
+    if window == Window::All {
+        return true;
+    }
+    let Some(ms) = due_ms else { return false };
+    let Some(due) = Utc.timestamp_millis_opt(ms).single() else { return false };
+    let today: NaiveDate = now.date_naive();
+    let due_day: NaiveDate = due.with_timezone(&now.timezone()).date_naive();
+    if due_day < today {
+        return true;
+    }
+    match window {
+        Window::Due => due_day == today,
+        Window::Today => due_day <= today.checked_add_days(Days::new(1)).unwrap_or(today),
+        Window::Week => due_day <= today.checked_add_days(Days::new(7)).unwrap_or(today),
+        Window::Month => end_of_month(today).is_some_and(|end| due_day <= end),
+        Window::Quarter => end_of_quarter(today).is_some_and(|end| due_day <= end),
+        Window::All => true,
+    }
+}
+
+fn priority_rank(priority: &str) -> u8 {
+    match priority {
+        "H" => 3,
+        "M" => 2,
+        "L" => 1,
+        _ => 0,
+    }
+}
+
+/// Time, projects, tags and priority combine with AND. A task has one
+/// project, so `projects` is always any-of; `tags` is any-of unless the
+/// filter asks for all of them.
+pub fn filter_matches<Tz: TimeZone>(filter: &FilterOut, task: &TaskOut, now: &DateTime<Tz>) -> bool {
+    if filter.is_break || !filter.facet.is_empty() {
+        // Both carry an `all` window, so without this they would match every
+        // task and starve the chips around them.
+        return false;
+    }
+    if !in_window(task.due_ms, now, Window::parse(&filter.time)) {
+        return false;
+    }
+    if !filter.projects.is_empty() && !filter.projects.contains(&task.project) {
+        return false;
+    }
+    if !filter.tags.is_empty() {
+        let hit = if filter.match_mode == "all" {
+            filter.tags.iter().all(|want| task.tags.contains(want))
+        } else {
+            filter.tags.iter().any(|want| task.tags.contains(want))
+        };
+        if !hit {
+            return false;
+        }
+    }
+    if !filter.priority.is_empty() {
+        let wanted = priority_rank(&filter.priority);
+        let have = priority_rank(&task.priority);
+        let hit = if filter.priority_mode == "atleast" {
+            // Unprioritised tasks are not "at least low".
+            have > 0 && have >= wanted
+        } else {
+            task.priority == filter.priority
+        };
+        if !hit {
+            return false;
+        }
+    }
+    true
+}
+
+/// The most entries a settings file may define. Entries are chips, line
+/// breaks and generated lines together, and the budget is what twelve chips
+/// (one per digit key, plus the h/l cycle) would have needed before the
+/// structural entries existed.
+pub const MAX_FILTERS: usize = 24;
+const MAX_VALUES: usize = 32;
+const MAX_VALUE_LEN: usize = 80;
+const MAX_NAME_LEN: usize = 40;
+
+/// One filter as the plugin sends it. Every field is optional: a missing or
+/// mistyped one is clamped, never refused, because a filter never reaches
+/// `task` - it only decides what the panel lists.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FilterIn {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    time: String,
+    #[serde(default)]
+    projects: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    priority: String,
+    #[serde(default, rename = "match")]
+    match_mode: String,
+    #[serde(default)]
+    priority_mode: String,
+    /// `{"break": true}`: a line break in the list, not a chip.
+    #[serde(default, rename = "break")]
+    is_break: bool,
+    /// `{"facet": "projects"}` or `{"facet": "tags"}`: a generated line.
+    #[serde(default)]
+    facet: String,
+}
+
+fn clamp_values(values: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        let v = value.trim();
+        if v.is_empty() || v.chars().count() > MAX_VALUE_LEN {
+            continue;
+        }
+        if !out.iter().any(|have| have == v) {
+            out.push(v.to_string());
+        }
+        if out.len() >= MAX_VALUES {
+            break;
+        }
+    }
+    out
+}
+
+fn clamp_name(name: &str, index: usize) -> String {
+    let trimmed: String = name.trim().chars().take(MAX_NAME_LEN).collect();
+    if trimmed.is_empty() {
+        format!("Filter {}", index + 1)
+    } else {
+        trimmed
+    }
+}
+
+fn normalise_filter(input: &FilterIn, index: usize) -> FilterOut {
+    let facet = match input.facet.trim().to_ascii_lowercase().as_str() {
+        "projects" => "projects",
+        "tags" => "tags",
+        _ => "",
+    };
+    if !facet.is_empty() {
+        // A generated line: the plugin builds its chips from the snapshot's
+        // projects or tags, so the entry itself carries no matching.
+        return FilterOut {
+            facet: facet.to_string(),
+            time: Window::All.as_str().to_string(),
+            match_mode: "any".to_string(),
+            priority_mode: "exact".to_string(),
+            ..FilterOut::default()
+        };
+    }
+    if input.is_break {
+        // No name, no window of its own, no projects or tags: a break must
+        // never be mistaken for a chip, and `filter_matches` refuses it.
+        return FilterOut {
+            is_break: true,
+            time: Window::All.as_str().to_string(),
+            match_mode: "any".to_string(),
+            priority_mode: "exact".to_string(),
+            ..FilterOut::default()
+        };
+    }
+    let priority = match input.priority.trim().to_ascii_uppercase().as_str() {
+        "H" => "H",
+        "M" => "M",
+        "L" => "L",
+        _ => "",
+    };
+    FilterOut {
+        name: clamp_name(&input.name, index),
+        time: Window::parse(&input.time).as_str().to_string(),
+        projects: clamp_values(&input.projects),
+        tags: clamp_values(&input.tags),
+        priority: priority.to_string(),
+        match_mode: if input.match_mode.trim().eq_ignore_ascii_case("all") { "all" } else { "any" }.to_string(),
+        priority_mode: if input.priority_mode.trim().eq_ignore_ascii_case("atleast") {
+            "atleast"
+        } else {
+            "exact"
+        }
+        .to_string(),
+        is_break: false,
+        facet: String::new(),
+        count: 0,
+    }
+}
+
+/// Filters as the plugin sent them (`--filters <json>`), normalised. An
+/// unparseable document yields no filters rather than an error.
+pub fn parse_filters(json: &str) -> Vec<FilterOut> {
+    let raw: Vec<FilterIn> = serde_json::from_str(json).unwrap_or_default();
+    raw.iter().take(MAX_FILTERS).enumerate().map(|(i, f)| normalise_filter(f, i)).collect()
+}
+
+/// What the plugin shows when it has no `filters` setting: the chips it has
+/// always offered, plus Month and Quarter.
+pub fn default_filters() -> Vec<FilterOut> {
+    let mut filters: Vec<FilterOut> = ["Due", "Today", "Week", "Month", "Quarter", "All"]
+        .iter()
+        .enumerate()
+        .map(|(index, name)| FilterOut {
+            name: (*name).to_string(),
+            time: Window::parse(name).as_str().to_string(),
+            match_mode: "any".to_string(),
+            priority_mode: "exact".to_string(),
+            ..normalise_filter(&FilterIn::default(), index)
+        })
+        .collect();
+    // The time chips get a line of their own, then a project line, then a tag
+    // line. Both generated lines are ordinary entries, so the plugin's
+    // settings can remove or move them like any other.
+    for facet in ["projects", "tags"] {
+        let at = filters.len();
+        filters.push(normalise_filter(&FilterIn { is_break: true, ..FilterIn::default() }, at));
+        filters.push(normalise_filter(
+            &FilterIn { facet: facet.to_string(), ..FilterIn::default() },
+            at + 1,
+        ));
+    }
+    filters
+}
+
 pub fn to_out<Tz: TimeZone>(raw: &RawTask, now: &DateTime<Tz>) -> TaskOut {
     let due = raw.due.as_deref().and_then(parse_ts);
     let notes: Vec<String> = raw
@@ -185,20 +515,35 @@ pub fn to_out<Tz: TimeZone>(raw: &RawTask, now: &DateTime<Tz>) -> TaskOut {
         active: raw.start.is_some(),
         blocked: !raw.depends.is_empty(),
         bucket: bucket_for(due, now),
+        filters: Vec::new(),
     }
 }
 
-/// Build the snapshot from an export. Pending tasks are listed; waiting ones
-/// only when `include_waiting` is set (they are always counted).
+/// Build the snapshot from an export, with the built-in chips.
 pub fn build_snapshot<Tz: TimeZone>(
     raw: &[RawTask],
     now: &DateTime<Tz>,
     include_waiting: bool,
     task_version: &str,
 ) -> Snapshot {
+    build_snapshot_filtered(raw, now, include_waiting, task_version, &default_filters())
+}
+
+/// Build the snapshot from an export. Pending tasks are listed; waiting ones
+/// only when `include_waiting` is set (they are always counted). Each
+/// filter's count and each task's `filters` cover exactly the listed tasks,
+/// so a filter's count is the number of rows the panel shows.
+pub fn build_snapshot_filtered<Tz: TimeZone>(
+    raw: &[RawTask],
+    now: &DateTime<Tz>,
+    include_waiting: bool,
+    task_version: &str,
+    filters: &[FilterOut],
+) -> Snapshot {
     let mut counts = Counts::default();
     let mut tasks: Vec<TaskOut> = Vec::new();
     let mut projects: std::collections::BTreeMap<String, ProjectCount> = Default::default();
+    let mut tag_uses: std::collections::BTreeMap<String, usize> = Default::default();
 
     for raw in raw {
         match raw.status.as_str() {
@@ -229,10 +574,21 @@ pub fn build_snapshot<Tz: TimeZone>(
             if out.bucket == Bucket::Overdue {
                 entry.overdue += 1;
             }
+            for tag in &out.tags {
+                *tag_uses.entry(tag.clone()).or_insert(0) += 1;
+            }
         }
         tasks.push(out);
     }
     counts.due = counts.overdue + counts.today;
+    for task in &tasks {
+        if in_window(task.due_ms, now, Window::Month) {
+            counts.month += 1;
+        }
+        if in_window(task.due_ms, now, Window::Quarter) {
+            counts.quarter += 1;
+        }
+    }
 
     // Most urgent first; ties by due date, then description, so the order
     // is stable between refreshes.
@@ -244,6 +600,28 @@ pub fn build_snapshot<Tz: TimeZone>(
             .then_with(|| a.description.cmp(&b.description))
     });
 
+    // Filters run last, over the finished list: a count is then the number
+    // of rows the panel shows, and each task carries the chips it is in.
+    let mut filters: Vec<FilterOut> = filters.to_vec();
+    for (index, filter) in filters.iter_mut().enumerate() {
+        let mut matched = 0;
+        for task in tasks.iter_mut() {
+            if filter_matches(filter, task, now) {
+                task.filters.push(index);
+                matched += 1;
+            }
+        }
+        filter.count = matched;
+    }
+
+    // Most-used first, ties by name, so the tag line is stable between
+    // refreshes and the useful tags are the ones you can reach.
+    let mut tags: Vec<TagCount> = tag_uses
+        .into_iter()
+        .map(|(name, pending)| TagCount { name, pending })
+        .collect();
+    tags.sort_by(|a, b| b.pending.cmp(&a.pending).then_with(|| a.name.cmp(&b.name)));
+
     Snapshot {
         ok: true,
         available: true,
@@ -251,6 +629,8 @@ pub fn build_snapshot<Tz: TimeZone>(
         generated_ms: now.timestamp_millis(),
         counts,
         projects: projects.into_values().collect(),
+        tags,
+        filters,
         tasks,
     }
 }
@@ -467,5 +847,288 @@ mod tests {
         assert!(!is_allowed_modification("++x"));
         assert!(is_allowed_add_word("project:nostr4"));
         assert!(!is_allowed_add_word("rc.confirmation=on"));
+    }
+
+    // 14:00 in New York (UTC-4) on the given day, so local midnight is 04:00Z.
+    fn at(y: i32, m: u32, d: u32) -> DateTime<FixedOffset> {
+        FixedOffset::west_opt(4 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(y, m, d, 14, 0, 0)
+            .unwrap()
+    }
+
+    fn ms(stamp: &str) -> i64 {
+        parse_ts(stamp).unwrap().timestamp_millis()
+    }
+
+    /// A task as the plugin sees it, through the real conversion.
+    fn task_out(uuid: &str, due: Option<&str>, project: &str, tags: &[&str], priority: &str) -> TaskOut {
+        let raw = RawTask {
+            id: 1,
+            uuid: uuid.into(),
+            description: format!("task {uuid}"),
+            due: due.map(String::from),
+            project: if project.is_empty() { None } else { Some(project.into()) },
+            priority: if priority.is_empty() { None } else { Some(priority.into()) },
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        };
+        to_out(&raw, &now())
+    }
+
+    fn filter(name: &str, time: &str, projects: &[&str], tags: &[&str], priority: &str) -> FilterOut {
+        FilterOut {
+            name: name.into(),
+            time: time.into(),
+            projects: projects.iter().map(|p| p.to_string()).collect(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            priority: priority.into(),
+            match_mode: "any".into(),
+            priority_mode: "exact".into(),
+            is_break: false,
+            facet: String::new(),
+            count: 0,
+        }
+    }
+
+    #[test]
+    fn months_and_quarters_end_where_they_should() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        assert_eq!(end_of_month(d(2026, 2, 10)), Some(d(2026, 2, 28)));
+        assert_eq!(end_of_month(d(2028, 2, 10)), Some(d(2028, 2, 29)), "leap year");
+        assert_eq!(end_of_month(d(2026, 12, 5)), Some(d(2026, 12, 31)));
+        assert_eq!(end_of_quarter(d(2026, 8, 10)), Some(d(2026, 9, 30)));
+        assert_eq!(end_of_quarter(d(2026, 1, 2)), Some(d(2026, 3, 31)));
+        assert_eq!(end_of_quarter(d(2026, 11, 30)), Some(d(2026, 12, 31)));
+    }
+
+    #[test]
+    fn windows_cover_the_month_and_quarter_not_just_the_week() {
+        let august = at(2026, 8, 10);
+        // Already late: in every window, including the shortest.
+        assert!(in_window(Some(ms("20260701T040000Z")), &august, Window::Week));
+        assert!(in_window(Some(ms("20260701T040000Z")), &august, Window::Quarter));
+        // A week out: week, month and quarter.
+        assert!(in_window(Some(ms("20260817T040000Z")), &august, Window::Week));
+        assert!(in_window(Some(ms("20260817T040000Z")), &august, Window::Month));
+        // September: past the week and past the month, inside the quarter.
+        assert!(!in_window(Some(ms("20260905T040000Z")), &august, Window::Week));
+        assert!(!in_window(Some(ms("20260905T040000Z")), &august, Window::Month));
+        assert!(in_window(Some(ms("20260905T040000Z")), &august, Window::Quarter));
+        // The last day of the month is in it; the first of October is not.
+        assert!(in_window(Some(ms("20260831T040000Z")), &august, Window::Month));
+        assert!(!in_window(Some(ms("20261001T040000Z")), &august, Window::Quarter));
+        assert!(in_window(Some(ms("20261001T040000Z")), &august, Window::All));
+        // No due date: only the unconstrained window.
+        assert!(!in_window(None, &august, Window::Month));
+        assert!(in_window(None, &august, Window::All));
+        // Due is overdue plus today; Today reaches tomorrow.
+        assert!(in_window(Some(ms("20260810T040000Z")), &august, Window::Due));
+        assert!(!in_window(Some(ms("20260811T040000Z")), &august, Window::Due));
+        assert!(in_window(Some(ms("20260811T040000Z")), &august, Window::Today));
+    }
+
+    #[test]
+    fn filters_combine_time_projects_tags_and_priority() {
+        // now() is 2026-09-28: the seven-day window reaches into October while
+        // the month and the quarter both end on the 30th.
+        let n = now();
+        let october = task_out("october", Some("20261002T040000Z"), "btcmap", &["next"], "H");
+        let month_end = task_out("month_end", Some("20260930T040000Z"), "bitfest", &["month"], "M");
+        let late = task_out("late", Some("20260901T040000Z"), "btcmap", &["quarter"], "");
+        let far = task_out("far", Some("20261201T040000Z"), "btcmap", &["next"], "L");
+        let two_tags = task_out("two_tags", Some("20260929T040000Z"), "btcmap", &["next", "month"], "");
+        let mixed = task_out("mixed", Some("20260929T040000Z"), "btcmap", &["next"], "M");
+
+        let this_month = filter("Month", "month", &[], &[], "");
+        assert!(filter_matches(&this_month, &month_end, &n));
+        assert!(filter_matches(&this_month, &late, &n), "late tasks are in every window");
+        assert!(filter_matches(&this_month, &two_tags, &n));
+        assert!(!filter_matches(&this_month, &october, &n), "past the end of the month");
+        assert!(!filter_matches(&this_month, &far, &n));
+
+        // A month is not a week: the seven-day window reaches past the month's
+        // end, and the month does not reach into the next one.
+        let this_week = filter("Week", "week", &[], &[], "");
+        assert!(filter_matches(&this_week, &october, &n));
+        assert!(!filter_matches(&this_month, &october, &n));
+
+        // Time AND project.
+        let btcmap_month = filter("BTC Map", "month", &["btcmap"], &[], "");
+        assert!(filter_matches(&btcmap_month, &late, &n));
+        assert!(filter_matches(&btcmap_month, &mixed, &n));
+        assert!(!filter_matches(&btcmap_month, &month_end, &n), "another project");
+        assert!(!filter_matches(&btcmap_month, &october, &n), "outside the month");
+
+        // Tags: any-of by default, all-of when the filter asks.
+        let any_tag = filter("any", "all", &[], &["next", "month"], "");
+        let all_tags = FilterOut { match_mode: "all".into(), ..filter("all", "all", &[], &["next", "month"], "") };
+        assert!(filter_matches(&any_tag, &october, &n));
+        assert!(filter_matches(&any_tag, &month_end, &n));
+        assert!(!filter_matches(&all_tags, &october, &n), "next only");
+        assert!(!filter_matches(&all_tags, &month_end, &n), "month only");
+        assert!(filter_matches(&all_tags, &two_tags, &n));
+
+        // Priority: exact, or everything at least that high.
+        let high = filter("High", "all", &[], &[], "H");
+        assert!(filter_matches(&high, &october, &n));
+        assert!(!filter_matches(&high, &month_end, &n));
+        let medium_up = FilterOut { priority_mode: "atleast".into(), ..filter("Medium+", "all", &[], &[], "M") };
+        assert!(filter_matches(&medium_up, &october, &n), "H is at least M");
+        assert!(filter_matches(&medium_up, &month_end, &n));
+        assert!(!filter_matches(&medium_up, &far, &n), "L is not");
+        assert!(!filter_matches(&medium_up, &late, &n), "and unprioritised is not 'at least low'");
+
+        // Everything at once, so each field has to hold.
+        let combined = FilterOut {
+            priority_mode: "atleast".into(),
+            ..filter("Combined", "month", &["btcmap"], &["next"], "M")
+        };
+        assert!(filter_matches(&combined, &mixed, &n));
+        assert!(!filter_matches(&combined, &two_tags, &n), "no priority");
+        assert!(!filter_matches(&combined, &october, &n), "outside the month");
+        assert!(!filter_matches(&combined, &late, &n), "not tagged next");
+    }
+
+    #[test]
+    fn filters_are_clamped_not_refused() {
+        let parsed = parse_filters(
+            r#"[{"name":"  ","time":"MOTH","projects":[" a ","a",""],"tags":["x"],
+                 "priority":"h","match":"ALL","priorityMode":"AtLeast"},
+                {"name":"Named","time":"quarter"}]"#,
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "Filter 1", "an empty name gets a number");
+        assert_eq!(parsed[0].time, "all", "an unknown window widens, and says so");
+        assert_eq!(parsed[0].projects, vec!["a"], "trimmed, de-duplicated, empties dropped");
+        assert_eq!(parsed[0].priority, "H");
+        assert_eq!(parsed[0].match_mode, "all");
+        assert_eq!(parsed[0].priority_mode, "atleast");
+        assert_eq!(parsed[1].name, "Named");
+        assert_eq!(parsed[1].time, "quarter");
+        assert_eq!(parsed[1].priority, "");
+        assert_eq!(parsed[1].match_mode, "any");
+        assert_eq!(parsed[1].priority_mode, "exact");
+
+        assert!(parse_filters("not json").is_empty());
+        assert!(parse_filters("{}").is_empty());
+        assert!(parse_filters("[]").is_empty());
+        let many = format!("[{}]", vec![r#"{"name":"x"}"#; MAX_FILTERS + 5].join(","));
+        assert_eq!(parse_filters(&many).len(), MAX_FILTERS, "capped");
+    }
+
+    #[test]
+    fn snapshot_counts_each_filter_over_the_listed_tasks() {
+        let raw = vec![
+            task("a", Some("20260927T040000Z"), "pending", Some("btcmap"), 12.0),
+            task("b", Some("20260928T040000Z"), "pending", Some("btcmap"), 15.0),
+            task("c", None, "pending", None, 1.0),
+            task("d", Some("20261101T040000Z"), "waiting", Some("btcmap"), 3.0),
+        ];
+        let filters = vec![filter("Due", "due", &[], &[], ""), filter("Month", "month", &[], &[], "")];
+        let snap = build_snapshot_filtered(&raw, &now(), false, "3.5.0", &filters);
+
+        // The waiting task is not listed, so no filter counts it.
+        assert_eq!(snap.counts.month, 2, "overdue plus due today, both this month");
+        assert_eq!(snap.counts.quarter, 2);
+        assert_eq!(snap.filters[0].name, "Due");
+        assert_eq!(snap.filters[0].count, 2);
+        assert_eq!(snap.filters[1].count, 2);
+        // Sorted by urgency: b (15), a (12), c (1).
+        assert_eq!(snap.tasks[0].uuid, "b");
+        assert_eq!(snap.tasks[0].filters, vec![0, 1]);
+        assert_eq!(snap.tasks[1].uuid, "a");
+        assert_eq!(snap.tasks[2].uuid, "c");
+        assert!(snap.tasks[2].filters.is_empty(), "no due date is in no window");
+
+        // Nothing configured: the chips the plugin has always had, plus the two.
+        let defaults = build_snapshot(&raw, &now(), false, "3.5.0");
+        let names: Vec<&str> = defaults.filters.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Due", "Today", "Week", "Month", "Quarter", "All", "", "", "", ""],
+            "the time chips, then a break and the projects line, then a break and the tags line"
+        );
+        assert_eq!(defaults.filters[3].time, "month");
+        assert_eq!(defaults.filters[5].count, 3, "All counts everything listed");
+        assert!(defaults.filters[6].is_break, "the chips get a line of their own");
+        assert_eq!(defaults.filters[7].facet, "projects");
+        assert!(defaults.filters[8].is_break);
+        assert_eq!(defaults.filters[9].facet, "tags");
+        assert_eq!(defaults.filters[7].count, 0, "a generated line counts nothing itself");
+    }
+
+    #[test]
+    fn tags_are_counted_most_used_first() {
+        let mut a = task("a", Some("20260927T040000Z"), "pending", Some("btcmap"), 12.0);
+        a.tags = vec!["btcmap".into(), "work".into()];
+        let mut b = task("b", None, "pending", None, 1.0);
+        b.tags = vec!["work".into()];
+        let mut d = task("d", Some("20261101T040000Z"), "waiting", Some("btcmap"), 3.0);
+        d.tags = vec!["ignored".into()];
+
+        let snap = build_snapshot(&vec![a, b, d], &now(), false, "3.5.0");
+        let names: Vec<&str> = snap.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["work", "btcmap"], "most used first, ties by name");
+        assert_eq!(snap.tags[0].pending, 2);
+        assert_eq!(snap.tags[1].pending, 1);
+        assert!(!names.contains(&"ignored"), "a waiting task is not listed, so neither are its tags");
+    }
+
+    #[test]
+    fn a_facet_entry_holds_its_position_and_matches_nothing() {
+        let parsed = parse_filters(r#"[{"name":"All","time":"all"},{"facet":"projects"},{"facet":"nonsense"}]"#);
+        assert_eq!(parsed[1].facet, "projects");
+        assert_eq!(parsed[2].facet, "", "an unknown facet is not a generated line");
+
+        let raw = vec![task("a", None, "pending", None, 1.0), task("b", None, "pending", None, 2.0)];
+        let filters = vec![
+            filter("All", "all", &[], &[], ""),
+            FilterOut {
+                facet: "projects".to_string(),
+                time: "all".to_string(),
+                match_mode: "any".to_string(),
+                priority_mode: "exact".to_string(),
+                ..FilterOut::default()
+            },
+        ];
+        let snap = build_snapshot_filtered(&raw, &now(), false, "3.5.0", &filters);
+        assert_eq!(snap.filters[1].count, 0, "a generated line counts nothing itself");
+        assert!(snap.tasks.iter().all(|t| !t.filters.contains(&1)), "no task is in a facet entry");
+    }
+
+    #[test]
+    fn a_break_entry_holds_its_position_and_matches_nothing() {
+        let parsed = parse_filters(r#"[{"name":"Due","time":"due"},{"break":true},{"name":"All","time":"all"}]"#);
+        assert_eq!(parsed.len(), 3);
+        assert!(!parsed[0].is_break);
+        assert!(parsed[1].is_break, "the flag survives the round trip");
+        assert_eq!(parsed[1].name, "", "a break is not a chip");
+        assert!(!parsed[2].is_break, "the chip after a break is unaffected");
+
+        let raw = vec![
+            task("a", Some("20260927T040000Z"), "pending", Some("btcmap"), 12.0),
+            task("c", None, "pending", None, 1.0),
+        ];
+        let filters = vec![
+            filter("Due", "due", &[], &[], ""),
+            FilterOut {
+                is_break: true,
+                time: "all".to_string(),
+                match_mode: "any".to_string(),
+                priority_mode: "exact".to_string(),
+                ..FilterOut::default()
+            },
+            filter("All", "all", &[], &[], ""),
+        ];
+        let snap = build_snapshot_filtered(&raw, &now(), false, "3.5.0", &filters);
+
+        // A break's own window is `all`, so without the guard in
+        // filter_matches it would count every listed task and the chip after
+        // it would appear to match nothing.
+        assert_eq!(snap.filters[1].count, 0, "a break counts nothing");
+        assert!(snap.tasks.iter().all(|t| !t.filters.contains(&1)), "no task is in a break");
+        assert_eq!(snap.filters[2].count, 2, "the chip after the break still matches both");
+        assert!(snap.tasks.iter().all(|t| t.filters.contains(&2)));
     }
 }

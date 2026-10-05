@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "derekross.tasks",
   "name": "Tasks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Derek Ross",
   "license": "MIT",
   "description": "Your Taskwarrior tasks in the Omarchy bar: a count of what's due, and a panel to add, finish, defer and sync tasks. Needs the taskbridge helper: run dist/install.sh.",
@@ -35,14 +35,15 @@
       "digestTime": "09:00",
       "digestDays": "mon,tue,wed,thu,fri",
       "refreshSeconds": 30,
-      "syncMinutes": 15
+      "syncMinutes": 15,
+      "filters": []
     },
     "schema": [
       {
         "key": "countMode",
         "type": "enum",
         "label": "Number on the bar",
-        "description": "due = overdue plus due today.",
+        "description": "due = overdue plus due today. The name of any filter you define works here too, and shows that filter's count.",
         "options": ["due", "overdue", "pending"],
         "defaultValue": "due"
       },

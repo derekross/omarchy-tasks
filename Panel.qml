@@ -4,13 +4,17 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// The tasks popup. A quick-add line, four views (Due, Today, Week, All),
-// project chips, and the list grouped by project. A row expands to its
-// notes, links and the triage actions: Done, Tomorrow, Next week, Snooze,
-// Open link, Edit. Everything has a key, see the key catcher below.
+// The tasks popup. A quick-add line, a row of filter chips (Due, Today,
+// Week, Month, Quarter, All, and any you define), project chips, and the
+// list grouped by project. A row expands to its notes, links and the triage
+// actions: Done, Tomorrow, Next week, Snooze, Open link, Edit, Delete.
+// Everything but Delete has a key (a destructive action should take a
+// deliberate click), see the key catcher below.
 //
-// BarWidget.qml owns the bar label and hands this panel the button to
-// anchor against and the service that runs taskbridge.
+// The chips and their counts come from the helper, which does the matching,
+// so the bar pill can show the same number for a filter. BarWidget.qml owns
+// the bar label and hands this panel the button to anchor against and the
+// service that runs taskbridge.
 Panel {
   id: root
   moduleName: "derekross.tasks"
@@ -21,22 +25,47 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  property string view: Model.normalizeView(String(setting("defaultView", "due")))
+  // The chips the helper matched, and the one the list is showing.
+  readonly property var filters: service ? service.filterList : []
+  property int filterIndex: 0
+  // Kept by name so a refresh, which sends a fresh list, cannot move it.
+  property string chosenFilterName: ""
+  readonly property var filter: {
+    if (filters.length === 0) return null
+    var at = Math.max(0, Math.min(filters.length - 1, filterIndex))
+    // A break or a generated line is not something the list can be showing.
+    if (!Model.isChip(filters[at])) {
+      var chips = Model.chipIndexes(filters)
+      if (chips.length === 0) return null
+      at = chips[0]
+    }
+    return filters[at]
+  }
+  // The entries grouped into lines: a break starts a new one, and a
+  // generated line sits inside the line it was placed on.
+  readonly property var filterLines: Model.entryLines(filters)
   property string project: ""
+  // The selected tag chip, narrowing the rows the same way the project does.
+  property string tag: ""
   property string cursorUuid: ""
   property string expandedUuid: ""
   property string editingUuid: ""
   property bool settingsOpen: false
+  // Which half of the settings is showing: "digest" or "filters".
+  property string settingsTab: "digest"
   property double now: Date.now()
   readonly property bool addFocused: addField.activeFocus
   // Keys go to a text field or a dropdown instead of the list while editing.
   property bool editorFocused: false
-  readonly property bool keysBlocked: addFocused || editingUuid !== "" || (settingsOpen && digestSettings.anyPopupOpen)
+  readonly property bool keysBlocked: addFocused || editingUuid !== ""
+    || (settingsOpen && (digestSettings.anyPopupOpen || filterSettings.anyPopupOpen
+      || filterSettings.anyFieldFocused))
 
   readonly property var allTasks: service ? service.tasks : []
-  readonly property var rows: Model.sortTasks(Model.filterTasks(allTasks, view, project), view)
+  readonly property var rows: Model.sortTasks(Model.tasksForFilter(allTasks, root.filterIndex, project, tag), root.filter)
   readonly property var groups: Model.groupByProject(rows)
   readonly property var projects: service ? service.projects : []
+  readonly property var tags: service ? service.tags : []
   readonly property var counts: service ? service.counts : ({})
   readonly property bool showHeaders: project === "" && groups.length > 1
 
@@ -51,6 +80,7 @@ Panel {
     if (!service) return "Tasks service is not running. Enable the plugin with omarchy plugin enable derekross.tasks."
     if (!service.helperAvailable) return "The omarchy-taskbridge helper is not installed. Run dist/install.sh from the plugin folder."
     if (!service.taskAvailable) return "Taskwarrior is not installed. Install the task package."
+    if (!service.filtersSupported) return "This taskbridge is older than the plugin and knows nothing about filters. Run dist/install.sh from the plugin folder to rebuild it."
     if (service.lastError) return service.lastError
     return ""
   }
@@ -58,11 +88,7 @@ Panel {
   readonly property string emptyText: {
     if (statusText !== "") return statusText
     if (rows.length > 0) return ""
-    var where = project !== "" ? " in " + project : ""
-    if (view === "due") return "Nothing overdue or due today" + where + "."
-    if (view === "today") return "Nothing due through tomorrow" + where + "."
-    if (view === "week") return "Nothing due this week" + where + "."
-    return "No pending tasks" + where + "."
+    return Model.emptyText(root.filter, project)
   }
 
   readonly property string footerText: {
@@ -168,11 +194,32 @@ Panel {
     stopEditing()
   }
 
-  function setView(v) {
-    root.view = Model.normalizeView(v)
+  function setFilterIndex(index) {
+    if (root.filters.length === 0) return
+    index = Math.max(0, Math.min(root.filters.length - 1, index))
+    if (!Model.isChip(root.filters[index])) return
+    root.filterIndex = index
+    root.chosenFilterName = root.filter ? String(root.filter.name) : ""
     root.expandedUuid = ""
     root.cursorUuid = ""
   }
+
+  function cycleFilter(delta) {
+    if (root.filters.length === 0) return
+    root.setFilterIndex(Model.cycleChipIndex(root.filters, root.filterIndex, delta))
+  }
+
+  // The helper sends a fresh list on every refresh, so the chip is kept by
+  // name and `defaultView` only decides where it starts.
+  function syncFilter() {
+    if (root.filters.length === 0) { root.filterIndex = 0; return }
+    var wanted = root.chosenFilterName !== "" ? root.chosenFilterName : String(root.setting("defaultView", "due"))
+    var at = Model.resolveFilterIndex(root.filters, wanted, root.filterIndex)
+    if (at !== root.filterIndex) root.filterIndex = at
+    if (root.chosenFilterName === "" && root.filter) root.chosenFilterName = String(root.filter.name)
+  }
+
+  onFiltersChanged: root.syncFilter()
 
   function setProject(p) {
     root.project = root.project === p ? "" : p
@@ -225,6 +272,8 @@ Panel {
   function done(task) { actOn(task, function(t) { service.done(t.uuid) }) }
   function defer(task, due) { actOn(task, function(t) { service.defer(t.uuid, due) }) }
   function snooze(task) { actOn(task, function(t) { service.wait(t.uuid, "1w") }) }
+  // Recoverable: task delete leaves the task in the database, and `u` undoes it.
+  function remove(task) { actOn(task, function(t) { service.remove(t.uuid) }) }
 
   // No shell: the URL was checked by the helper and is checked again here,
   // then handed to Qt, which asks the desktop to open it.
@@ -288,10 +337,7 @@ Panel {
       blocked: root.keysBlocked
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveCursor(dy)
-        if (dx !== 0) {
-          var at = Model.VIEWS.indexOf(root.view)
-          root.setView(Model.VIEWS[(at + dx + Model.VIEWS.length) % Model.VIEWS.length])
-        }
+        if (dx !== 0) root.cycleFilter(dx)
       }
       onActivateRequested: { var t = root.focusedTask(); if (t) root.toggleExpanded(t.uuid) }
       onCloseRequested: {
@@ -316,10 +362,12 @@ Panel {
         else if (t === "u" || t === "U") { if (root.service) root.service.undo() }
         else if (t === "[") root.cycleProject(-1)
         else if (t === "]") root.cycleProject(1)
-        else if (t === "1") root.setView("due")
-        else if (t === "2") root.setView("today")
-        else if (t === "3") root.setView("week")
-        else if (t === "4") root.setView("all")
+        else if (t >= "1" && t <= "9") {
+          // Digits count chips, so a break or a generated line in the list
+          // cannot shift which chip a number reaches.
+          var at = Model.chipIndexForOrdinal(root.filters, parseInt(t, 10))
+          if (at >= 0) root.setFilterIndex(at)
+        }
       }
 
       Flickable {
@@ -405,7 +453,7 @@ Panel {
 
               PanelActionButton {
                 iconText: "󰒓"
-                tooltipText: root.settingsOpen ? "Back to the list (Esc)" : "Daily digest settings (g)"
+                tooltipText: root.settingsOpen ? "Back to the list (Esc)" : "Settings (g): the daily digest and the filter chips"
                 foreground: root.settingsOpen ? Color.accent : root.foreground
                 fontFamily: root.fontFamily
                 onClicked: root.toggleSettings()
@@ -413,10 +461,35 @@ Panel {
             }
           }
 
-          // ---- Settings, in place of the list while open.
+          // ---- Settings, in place of the list while open. Two tabs, because
+          // nothing in the shell renders a plugin's settings for it.
+          Row {
+            visible: root.settingsOpen
+            spacing: Style.space(4)
+
+            Repeater {
+              model: [
+                { id: "digest", label: "Digest", hint: "One notification a day with what's overdue and due today" },
+                { id: "filters", label: "Filters", hint: "The chips above: what each one shows, and what the bar counts" }
+              ]
+
+              Button {
+                required property var modelData
+                text: modelData.label
+                tooltipText: modelData.hint
+                selected: root.settingsTab === modelData.id
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                bordered: true
+                onClicked: root.settingsTab = modelData.id
+              }
+            }
+          }
+
           DigestSettings {
             id: digestSettings
-            visible: root.settingsOpen
+            visible: root.settingsOpen && root.settingsTab === "digest"
             width: parent.width
             enabled: root.setting("digestEnabled", true) !== false
             time: String(root.setting("digestTime", "09:00"))
@@ -425,6 +498,23 @@ Panel {
             fontFamily: root.fontFamily
             onChanged: function(values) { root.persistSettings(values) }
             onSendNow: if (root.service) root.service.sendDigest()
+            onClosed: root.settingsOpen = false
+          }
+
+          FilterSettings {
+            id: filterSettings
+            visible: root.settingsOpen && root.settingsTab === "filters"
+            width: parent.width
+            filters: root.filters
+            projects: {
+              var out = []
+              for (var i = 0; i < root.projects.length; i++) out.push(String(root.projects[i].name))
+              return out
+            }
+            tags: Model.tagList(root.allTasks)
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onChanged: function(values) { root.persistSettings(values) }
             onClosed: root.settingsOpen = false
           }
 
@@ -440,53 +530,102 @@ Panel {
             Keys.onPressed: function(event) { root.handleAddKey(event) }
           }
 
-          // ---- Views.
-          Row {
+          // ---- Filters. Whatever entries the helper was given: chips with a
+          // window of their own, and generated lines of projects or tags. A
+          // break entry starts a new line, drawn with a hairline between them.
+          Column {
             visible: !root.settingsOpen
-            spacing: Style.space(4)
-
-            Repeater {
-              model: [
-                { id: "due", label: "Due", hint: "Overdue and due today (1)" },
-                { id: "today", label: "Today", hint: "Through tomorrow (2)" },
-                { id: "week", label: "Week", hint: "The next seven days (3)" },
-                { id: "all", label: "All", hint: "Every pending task, most urgent first (4)" }
-              ]
-
-              Button {
-                required property var modelData
-                text: modelData.label
-                tooltipText: modelData.hint
-                selected: root.view === modelData.id
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                bordered: true
-                onClicked: root.setView(modelData.id)
-              }
-            }
-          }
-
-          // ---- Project chips, only when there is more than one.
-          Flow {
             width: parent.width
-            spacing: Style.space(4)
-            visible: !root.settingsOpen && root.projects.length > 1
+            spacing: Style.space(5)
 
             Repeater {
-              model: root.projects
+              model: root.filterLines
 
-              Button {
+              Column {
+                id: filterLine
                 required property var modelData
-                text: Model.projectLabel(modelData.name) + " " + modelData.pending
-                tooltipText: modelData.overdue > 0 ? modelData.overdue + " overdue" : "Only " + Model.projectLabel(modelData.name)
-                selected: root.project === modelData.name
-                foreground: modelData.overdue > 0 && root.project !== modelData.name ? root.urgent : root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                horizontalPadding: Style.space(7)
-                verticalPadding: Style.space(3)
-                onClicked: root.setProject(modelData.name)
+                required property int index
+                width: parent.width
+                spacing: Style.space(4)
+
+                // A hairline between the lines, never above the first.
+                Rectangle {
+                  visible: filterLine.index > 0
+                  width: parent.width
+                  height: 1
+                  color: root.foreground
+                  opacity: 0.15
+                }
+
+                Flow {
+                  width: parent.width
+                  spacing: Style.space(4)
+
+                  Repeater {
+                    model: filterLine.modelData
+
+                    Row {
+                      id: lineEntry
+                      required property var modelData
+                      readonly property var entry: root.filters[lineEntry.modelData]
+                      readonly property string kind: Model.facetKind(lineEntry.entry)
+                      spacing: Style.space(4)
+
+                      // A chip: a window of its own.
+                      Button {
+                        visible: Model.isChip(lineEntry.entry)
+                        readonly property int ordinal: Model.chipOrdinal(root.filters, lineEntry.modelData)
+                        text: String(lineEntry.entry.name === undefined ? "" : lineEntry.entry.name)
+                        tooltipText: {
+                          var parts = [String(lineEntry.entry.count) + (lineEntry.entry.count === 1 ? " task" : " tasks")]
+                          if (ordinal > 0 && ordinal < 10) parts.push("(" + ordinal + ")")
+                          var summary = Model.filterSummary(lineEntry.entry)
+                          if (summary !== "") parts.push(summary)
+                          return parts.join(" · ")
+                        }
+                        selected: root.filterIndex === lineEntry.modelData
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.bodySmall
+                        bordered: true
+                        onClicked: root.setFilterIndex(lineEntry.modelData)
+                      }
+
+                      // A generated line: one chip per project, or per tag.
+                      // Selecting one takes rows away, like the project chips
+                      // always have.
+                      Flow {
+                        visible: Model.isFacet(lineEntry.entry)
+                        spacing: Style.space(4)
+
+                        Repeater {
+                          model: Model.facetItems(lineEntry.entry, root.projects, root.tags)
+
+                          Button {
+                            required property var modelData
+                            readonly property bool isTag: lineEntry.kind === "tags"
+                            readonly property string value: String(modelData.name === undefined ? "" : modelData.name)
+                            text: (isTag ? Model.tagLabel(value) : Model.projectLabel(value)) + " " + modelData.pending
+                            tooltipText: isTag
+                              ? (modelData.pending === 1 ? "1 task tagged " : modelData.pending + " tasks tagged ") + Model.tagLabel(value)
+                              : (modelData.overdue > 0 ? modelData.overdue + " overdue" : "Only " + Model.projectLabel(value))
+                            selected: isTag ? root.tag === value : root.project === value
+                            foreground: isTag ? root.foreground
+                              : (modelData.overdue > 0 && root.project !== value ? root.urgent : root.foreground)
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.caption
+                            horizontalPadding: Style.space(7)
+                            verticalPadding: Style.space(3)
+                            onClicked: {
+                              if (isTag) root.tag = root.tag === value ? "" : value
+                              else root.setProject(value)
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -670,6 +809,11 @@ Panel {
                         fontFamily: root.fontFamily
                         onSaved: function(changes) { root.saveEdit(row.task, changes) }
                         onCancelled: root.stopEditing()
+                        onDeleted: function(uuid) {
+                          if (uuid === "") return
+                          root.stopEditing()
+                          root.remove(row.task)
+                        }
                       }
                     }
 
@@ -771,6 +915,15 @@ Panel {
                         fontSize: Style.font.caption
                         bordered: true
                         onClicked: root.startEditing(row.task)
+                      }
+                      Button {
+                        text: "Delete"
+                        tooltipText: "task delete: leaves the list, u undoes it"
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        bordered: true
+                        onClicked: root.remove(row.task)
                       }
                     }
                   }
